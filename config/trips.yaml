@@ -1,0 +1,19 @@
+trips:
+  - name: "Calgary Aug 2026"
+    csv_name: "Calgary Aug 2026"        # stable key for CSV history; never rename
+    provider: "costco"                  # booking|costco; default booking
+    pickup_location: "YYC"              # IATA code or city name; resolved via searchDestination
+    dropoff_location: "YYC"             # same code = round-trip
+    pickup_date: "2026-08-16"
+    dropoff_date: "2026-08-22"
+    pickup_time: "12:00"                # local time at pickup_location
+    dropoff_time: "12:00"
+    driver_age: 56
+    car_class: "midsize_suv"            # midsize_suv|economy|compact|midsize|fullsize|suv|minivan|any
+    currency: "CAD"                     # Costco serves CAD for YYC pickups; the searcher honors data-currency-code anyway
+
+search:
+  alert_threshold: 0.10                 # notify when cheapest-in-class is >=10% below 7-day rolling avg
+  history_days: 7                       # rolling window for analyzer
+  cache_ttl_hours: 6                    # skip API re-call within this window
+  top_n_in_html: 5                      # how many offers per trip on the dashboard

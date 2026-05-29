@@ -104,7 +104,14 @@ def _history_for_trip(csv_path: Path, trip_name: str, days: int = 30) -> list[di
     return sorted(by_day.values(), key=lambda r: r["timestamp"], reverse=True)
 
 
-def _history_table(rows: list[dict]) -> str:
+def _history_table(rows: list[dict], book_link: str = "") -> str:
+    """SUV-only price history.
+
+    The CSV's ``cheapest_in_class_*`` columns are the requested class (an SUV
+    for every current trip), so we render those alone and drop the
+    cheapest-overall column — that was tracking whatever compact happened to be
+    cheapest, which is noise for an SUV search.
+    """
     if not rows:
         return '<p style="color:#94a3b8;font-size:0.85rem;">No history yet.</p>'
 
@@ -114,27 +121,35 @@ def _history_table(rows: list[dict]) -> str:
         except ValueError:
             return None
 
-    overall_prices = [p for r in rows if (p := _to_float(r.get("cheapest_price"))) is not None]
     inclass_prices = [p for r in rows if (p := _to_float(r.get("cheapest_in_class_price"))) is not None]
-    lo_overall = min(overall_prices) if overall_prices else None
     lo_inclass = min(inclass_prices) if inclass_prices else None
 
-    out = ['<table><tr><th>Date</th><th>Cheapest in class</th><th>Cheapest overall</th><th>Supplier</th></tr>']
+    book_header = "<th>Book</th>" if book_link else ""
+    out = [
+        '<table><tr><th>Date</th><th>SUV price</th>'
+        f"<th>Supplier</th><th>Vehicle</th>{book_header}</tr>"
+    ]
     for r in rows[:30]:
         date = r["timestamp"][:10]
-        c_in = _to_float(r.get("cheapest_in_class_price"))
-        c_ov = _to_float(r.get("cheapest_price"))
+        suv = _to_float(r.get("cheapest_in_class_price"))
         currency = _esc(r.get("currency", ""))
-        c_in_html = (
-            f'<td class="price-cell {"low" if lo_inclass is not None and c_in <= lo_inclass else ""}">'
-            f"{currency} {c_in:,.0f}</td>"
-        ) if c_in is not None else '<td class="empty">—</td>'
-        c_ov_html = (
-            f'<td class="price-cell {"low" if lo_overall is not None and c_ov <= lo_overall else ""}">'
-            f"{currency} {c_ov:,.0f}</td>"
-        ) if c_ov is not None else '<td class="empty">—</td>'
-        supplier = _esc(r.get("cheapest_in_class_supplier") or r.get("cheapest_supplier", ""))
-        out.append(f"<tr><td>{date}</td>{c_in_html}{c_ov_html}<td>{supplier}</td></tr>")
+        if suv is not None:
+            low = "low" if lo_inclass is not None and suv <= lo_inclass else ""
+            price_html = f'<td class="price-cell {low}">{currency} {suv:,.0f}</td>'
+            supplier = _esc(r.get("cheapest_in_class_supplier", ""))
+            vehicle = _esc(r.get("cheapest_in_class_vehicle", "")) or "—"
+        else:
+            price_html = '<td class="empty">—</td>'
+            supplier = '<span style="color:#cbd5e1">no SUV</span>'
+            vehicle = "—"
+        book_cell = (
+            f'<td><a href="{_esc(book_link)}" target="_blank" rel="noopener">Book ↗</a></td>'
+            if book_link else ""
+        )
+        out.append(
+            f"<tr><td>{date}</td>{price_html}"
+            f"<td>{supplier}</td><td>{vehicle}</td>{book_cell}</tr>"
+        )
     out.append("</table>")
     return "\n".join(out)
 
@@ -186,8 +201,8 @@ def _render_card(result: CarRentalResult, trip_cfg: dict, alert_pct_below: float
             f"{cls_line}"
             f'<div class="section-title">Top offers this run</div>'
             f"{_offer_table(result.sampled_offers)}"
-            f'<div class="section-title">Price history</div>'
-            f"{_history_table(_history_for_trip(csv_path, result.trip_name))}"
+            f'<div class="section-title">SUV price history</div>'
+            f"{_history_table(_history_for_trip(csv_path, result.trip_name), headline.deep_link)}"
         )
 
     return (

@@ -52,6 +52,13 @@ config/trips.yaml ─┐
 - **Don't add features to `searcher.py`** that touch the analyzer or notifier —
   keep the search layer thin and dumb. Class filtering lives there because it's
   about response parsing; *price thresholding* lives in analyzer.py.
+- **Dashboard "SUV price history" is in-class only.** `html_writer._history_table`
+  renders the CSV's `cheapest_in_class_*` columns (the requested class — an SUV
+  for every current trip): Date · SUV price · Supplier · Vehicle · Book. The
+  cheapest-overall column was dropped (it tracked whatever compact was cheapest,
+  noise for an SUV search). The per-row "Book ↗" link is the trip's current
+  `deep_link` (for Costco that's the search-form URL — robots.txt forbids
+  drill-down, so there is no per-offer URL to store); history rows reuse it.
 
 ## Verification quick-reference
 

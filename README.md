@@ -10,6 +10,14 @@ notify-send + systemd-timer pattern.
 
 **Live site:** https://xiangao.github.io/rental-car-bot-site/ (after you bootstrap `site/`)
 
+> **Status (2026-06-01):** the active trip uses the **Costco** provider
+> (`config/trips.yaml`) because the booking-com15 API was erroring in late May.
+> Costco is behind Akamai Bot Manager, which serves *launched* automation
+> browsers a non-functional search form. The scraper now drives a **real,
+> headful Google Chrome over CDP** (auto-launched on `:9222`), which passes
+> Akamai — verified returning 27 offers. **Requires an active desktop (X)
+> session when it runs.** See the `CLAUDE.md` Costco "2026-06-01" note for details.
+
 ## Setup
 
 ### 1. RapidAPI key

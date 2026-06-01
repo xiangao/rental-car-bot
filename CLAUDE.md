@@ -99,6 +99,46 @@ provider-agnostic.
 
 ### Costco provider — `code/costco_searcher.py`
 
+> **2026-05-31 — site redesign + Akamai POST block (IMPORTANT).**
+> Costco redesigned the rental search form. Three `_fetch_results_html` /
+> `_fill_typeahead` bugs were found and fixed (all verified live):
+> 1. **Location typeahead** — markup changed from jQuery-UI
+>    (`ul.ui-autocomplete` / `.ui-menu-item`) to `<ul class="ui-list">` with
+>    `<li class="airport" data-value="YYC" role="option">`. Fix: read the
+>    input's `aria-controls` (a UUID id → use a `[id="…"]` attribute selector,
+>    NOT `#id`, since it starts with a digit) and click `li[data-value='YYC']`.
+>    Avoid generic `[role=option]` — its first item is a country header.
+> 2. **Time `<select>`** — the 12:00 slots are *labelled* "Noon"/"Midnight",
+>    so `select_option(label=…)` times out. Fix: `select_option(value=…)`
+>    (values are still the "HH:MM AM/PM" strings).
+> 3. **Date** — inputs are jQuery-UI datepickers (`hasDatepicker`); injecting
+>    `.value` leaves the picker's internal model null → the search silently
+>    no-ops. Fix: `$(input).datepicker('setDate', new Date(y, m, day))`
+>    (jQuery is global as `window.jQuery`).
+>
+> **Remaining wall:** even with every field valid, clicking Search fires
+> `POST /rentalCarSearch.act` that gets **no response** (not 403 — dropped) →
+> Akamai blocking the headless browser. This appeared only AFTER ~8 rapid
+> debug runs flagged the IP. As of 2026-05-31 it's UNVERIFIED whether a clean
+> once-daily run from a cold IP succeeds — the timer was set up (pre-stamped,
+> first run Mon 2026-06-01 11:30) precisely to test that. **If it still returns
+> 0 offers from a cold IP, the realistic options are: try `provider:booking`
+> again, a stealthier browser (patchright/camoufox) + residential proxy, or a
+> different data source.** Do NOT burst-test against Costco while debugging.
+>
+> **2026-06-01 — RESOLVED (cold-IP test failed; fixed via real Chrome over CDP).**
+> The cold 11:30 run returned 0 offers, confirming the wall. A live diagnostic
+> showed the *launched* Chromium (even `channel="chromium"`) is served a
+> degraded form: clicking Search fires **no** `/rentalCarSearch.act` at all
+> (only Akamai's sensor beacon) because the search handler never initializes.
+> Fix: `_fetch_results_html` now drives a **real, headful `google-chrome`** over
+> CDP (`connect_over_cdp(http://localhost:9222)`) instead of launching Chromium.
+> `_ensure_chrome()` launches/reuses google-chrome on a dedicated profile
+> (`~/.cache/chrome-rental-bot`, `DISPLAY` defaults to `:1`). Verified: 27
+> offers, `POST /rentalCarSearch.act` → 200. The 3 form fixes above are still
+> needed; this only changes the *browser*. **Caveat:** headful Chrome needs an
+> active X display, so the daily run must happen while the desktop session is up.
+
 - **Login:** none required for browsing. Membership only matters at booking.
 - **Currency:** Costco serves CAD by default for YYC pickups (geo-detected
   from the browser's timezone). The scraper honors `data-currency-code` on
@@ -108,18 +148,23 @@ provider-agnostic.
 - **Driver age:** Costco only branches on under-25 vs 25+ via a checkbox
   (`#driversAgeWidget`). The searcher converts `driver_age >= 25` to a
   checked box. The numeric value in `trips.yaml` is informational only.
-- **Akamai Bot Manager:** active on costcotravel.com. The headless-shell
-  build of Chromium gets rejected at the TLS/HTTP-2 layer
-  (`ERR_HTTP2_PROTOCOL_ERROR`). The searcher uses the **full Chromium**
-  build via `channel="chromium"` plus a light stealth init script.
-  Install both: `python -m playwright install chromium`.
+- **Akamai Bot Manager:** active on costcotravel.com, and it scores *behavior*,
+  not just the TLS handshake. History: headless-shell Chromium is rejected at
+  the network layer (`ERR_HTTP2_PROTOCOL_ERROR`); full `channel="chromium"`
+  clears the handshake but (as of 2026-06-01) is served a non-functional form.
+  **Current approach: drive a real, headful `google-chrome` over CDP** —
+  `_ensure_chrome()` launches/reuses it on `:9222` against a dedicated profile,
+  and `_fetch_results_html` attaches via `connect_over_cdp`. No
+  `playwright install` needed for this path (uses system Chrome), but headful
+  Chrome requires an active X display (`DISPLAY`, default `:1`).
 - **Robots.txt:** `/Rental-Cars` and `/rentalCarSearch.act` are allowed;
   `/rc/` (results-detail pages) is disallowed. The scraper stops at the
   results listing — do not add drill-down code. `deep_link` is set to the
   search-form URL, not an individual offer URL.
-- **Cadence:** the existing user systemd timer (`OnCalendar=*-*-* 09:00:00`)
-  is correct. **Do not tighten it.** Once-per-day stays well below Akamai's
-  scoring thresholds; minute-or-hour cadence will get the IP flagged.
+- **Cadence:** the user systemd timer is `OnCalendar=*-*-* 11:30:00` (daily,
+  changed from 09:00 on 2026-05-31). **Do not tighten it.** Once-per-day stays
+  well below Akamai's scoring thresholds; minute-or-hour cadence — *or a burst
+  of debugging runs* — will get the IP flagged (see 2026-05-31 note below).
 - **First-run debug:** on first encounter the rendered results HTML is
   dumped to `data/debug/costcoSearchCarRentals.html`. If selectors in
   `_parse_results` stop matching after a Costco redesign, wipe that file,

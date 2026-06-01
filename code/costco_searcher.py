@@ -21,15 +21,18 @@ the captured DOM.
 
 import hashlib
 import json
+import os
 import re
+import shutil
+import subprocess
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from playwright.sync_api import (
     Page,
-    Playwright,
     TimeoutError as PlaywrightTimeout,
     sync_playwright,
 )
@@ -42,11 +45,17 @@ DEBUG_DIR = BASE_DIR / "data" / "debug"
 
 SEARCH_URL = "https://www.costcotravel.com/Rental-Cars"
 
-# Recent stable desktop Chrome on Linux — match what real users send.
-UA = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
+# Costco sits behind Akamai Bot Manager. A *launched* automation Chromium (even
+# channel="chromium") is served a degraded form whose search handler never
+# initializes, so the submit silently no-ops and 0 offers come back. A real,
+# headful google-chrome driven over CDP passes Akamai's behavioral check
+# (verified 2026-06-01: 29 result cards, POST /rentalCarSearch.act → 200). We
+# launch one on this port against a dedicated profile dir (separate from the
+# user's main Chrome so the singleton lock doesn't collide) and reuse it across
+# daily runs, which also lets the Akamai cookies warm.
+CDP_PORT = 9222
+CDP_URL = f"http://localhost:{CDP_PORT}"
+CHROME_PROFILE = Path.home() / ".cache" / "chrome-rental-bot"
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -109,44 +118,95 @@ def _price_to_float(s: str) -> float | None:
 # Browser flow
 # ────────────────────────────────────────────────────────────────────────────────
 
-def _new_context(p: Playwright):
-    """Full headless Chromium with a realistic-looking fingerprint.
+def _chrome_up() -> bool:
+    """True if a Chrome DevTools endpoint is already listening on the CDP port."""
+    try:
+        urllib.request.urlopen(f"{CDP_URL}/json/version", timeout=2)
+        return True
+    except Exception:
+        return False
 
-    Use channel='chromium' (not the default headless shell) — Akamai Bot
-    Manager rejects the headless-shell TLS/HTTP-2 fingerprint at the
-    network layer with ERR_HTTP2_PROTOCOL_ERROR, while the full chromium
-    build passes the initial handshake.
+
+def _ensure_chrome() -> None:
+    """Make sure a real, headful google-chrome is listening on the CDP port.
+
+    Reuses an already-running instance (so cookies warm across runs); otherwise
+    launches one against CHROME_PROFILE. Headful needs an X display — the bot
+    runs on the user's desktop session, so DISPLAY defaults to ":1" when unset
+    (e.g. under the systemd user timer).
     """
-    browser = p.chromium.launch(
-        channel="chromium",
-        headless=True,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
+    if _chrome_up():
+        return
+    chrome = shutil.which("google-chrome") or "/usr/bin/google-chrome"
+    CHROME_PROFILE.mkdir(parents=True, exist_ok=True)
+    # A stale singleton lock makes a second launch silently forward to the old
+    # instance and DROP --remote-debugging-port, so clear it first.
+    for lock in CHROME_PROFILE.glob("Singleton*"):
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+    env = dict(os.environ)
+    env.setdefault("DISPLAY", ":1")
+    # Under the systemd --user timer, DISPLAY/XAUTHORITY aren't inherited. Point
+    # at the active session's gdm cookie so headful Chrome can attach to the X
+    # server (the login session keeps this file for as long as the user is in).
+    if "XAUTHORITY" not in env:
+        xauth = Path(f"/run/user/{os.getuid()}/gdm/Xauthority")
+        if xauth.exists():
+            env["XAUTHORITY"] = str(xauth)
+    subprocess.Popen(
+        [
+            chrome,
+            f"--remote-debugging-port={CDP_PORT}",
+            f"--user-data-dir={CHROME_PROFILE}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "about:blank",
         ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,  # outlive this process so the next run can reuse it
+        env=env,
     )
-    context = browser.new_context(
-        user_agent=UA,
-        viewport={"width": 1440, "height": 900},
-        locale="en-US",
-        timezone_id="America/Edmonton",  # Calgary-equivalent for the user's typical search
+    for _ in range(40):
+        if _chrome_up():
+            return
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"Chrome did not come up on {CDP_URL}. Headful Chrome needs an X "
+        f"display (DISPLAY={env.get('DISPLAY')}); Costco's Akamai requires a "
+        f"real browser, so a desktop session must be active when this runs."
     )
-    # Light stealth: hide the navigator.webdriver flag the way real browsers don't expose it.
-    context.add_init_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-    )
-    return browser, context
 
 
 def _fill_typeahead(page: Page, selector: str, value: str) -> None:
-    """Type into a Costco typeahead, wait for the dropdown, click the first match."""
+    """Type into a Costco typeahead and click the matching airport entry.
+
+    Costco's typeahead renders ``<ul class="ui-list" role="listbox">`` with
+    ``<li class="airport" data-value="YYC" role="option">`` items, and the input's
+    ``aria-controls`` attribute points at that ``<ul>``'s dynamically-generated id.
+    We prefer the exact ``data-value`` match (the IATA/location code), else the
+    first real entry — NOT the generic ``[role=option]``, whose first item is a
+    country header. (The pre-2026 jQuery-UI markup — ``ul.ui-autocomplete`` /
+    ``.ui-menu-item`` — no longer exists; selecting it left the location unset and
+    the whole search silently failed.)
+    """
     page.click(selector)
     page.fill(selector, "")
     page.type(selector, value, delay=80)
-    # The autocomplete panel typically renders within ~1s.
     try:
-        page.wait_for_selector("ul.ui-autocomplete li, .ui-menu-item", timeout=5000)
-        page.click("ul.ui-autocomplete li:first-child, .ui-menu-item:first-child")
+        list_id = page.get_attribute(selector, "aria-controls", timeout=5000)
+        # aria-controls ids begin with a digit, so a "#id" CSS selector is invalid —
+        # use an attribute selector, which accepts any value.
+        list_sel = f'[id="{list_id}"]' if list_id else "ul.ui-list[role='listbox']"
+        page.wait_for_selector(f"{list_sel} li[data-value]", timeout=5000)
+        exact = page.locator(f"{list_sel} li[data-value='{value}']")
+        if exact.count():
+            exact.first.click()
+        else:
+            page.locator(f"{list_sel} li[data-value]").first.click()
     except PlaywrightTimeout:
         # Fall back: press Enter and hope Costco accepts the literal text.
         page.press(selector, "Enter")
@@ -154,16 +214,18 @@ def _fill_typeahead(page: Page, selector: str, value: str) -> None:
 
 def _fetch_results_html(trip: dict) -> str:
     """Drive Playwright through the Costco form and return the results-page HTML."""
-    pickup_date = _date_mdy(trip["pickup_date"])
-    dropoff_date = _date_mdy(trip["dropoff_date"])
     pickup_time = _time_12h(trip["pickup_time"])
     dropoff_time = _time_12h(trip["dropoff_time"])
     same_location = trip["pickup_location"] == trip["dropoff_location"]
 
+    _ensure_chrome()
     with sync_playwright() as p:
-        browser, context = _new_context(p)
+        browser = p.chromium.connect_over_cdp(CDP_URL)
+        # Use the real profile's default context (not a fresh new_context) so
+        # the warmed Akamai cookies carry over between runs.
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = context.new_page()
         try:
-            page = context.new_page()
             page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=45000)
             # Let Akamai's sensor script finish and the React form mount.
             page.wait_for_load_state("networkidle", timeout=45000)
@@ -177,28 +239,36 @@ def _fetch_results_html(trip: dict) -> str:
                 page.check("input[name='carDropOfLocationType'][value='differentLocation']")
                 _fill_typeahead(page, "#dropoffLocationTextWidget", trip["dropoff_location"])
 
-            # Dates: Costco's widgets accept direct value injection + change event.
-            for sel, val in (
-                ("#pickUpDateWidget", pickup_date),
-                ("#dropOffDateWidget", dropoff_date),
+            # Dates: the widgets are jQuery-UI datepickers (class "hasDatepicker").
+            # Injecting the input's .value leaves the picker's *internal* selected
+            # date null, so Costco's search validates against null and silently
+            # no-ops. Setting it through the datepicker API populates both the input
+            # value and the internal model in one shot.
+            for sel, iso in (
+                ("#pickUpDateWidget", trip["pickup_date"]),
+                ("#dropOffDateWidget", trip["dropoff_date"]),
             ):
+                d = datetime.strptime(iso, "%Y-%m-%d")
                 page.evaluate(
-                    "([sel, val]) => {"
-                    "  const el = document.querySelector(sel);"
-                    "  if (el) { el.value = val;"
-                    "    el.dispatchEvent(new Event('input', {bubbles: true}));"
-                    "    el.dispatchEvent(new Event('change', {bubbles: true})); }"
+                    "([sel, y, m, day]) => {"
+                    "  const jq = window.jQuery || window.$;"
+                    "  if (!jq) return;"
+                    "  const el = jq(sel);"
+                    "  if (el.length) { el.datepicker('setDate', new Date(y, m, day));"
+                    "    el.trigger('change'); }"
                     "}",
-                    [sel, val],
+                    [sel, d.year, d.month - 1, d.day],   # JS months are 0-based
                 )
 
-            # Times.
+            # Times: each <option>'s VALUE is the "HH:MM AM/PM" string, but the
+            # 12:00 slots are *labelled* "Noon"/"Midnight" — so select by value
+            # (selecting by label times out on those slots).
             for sel, val in (
                 ("#pickupTimeWidget", pickup_time),
                 ("#dropoffTimeWidget", dropoff_time),
             ):
                 try:
-                    page.select_option(sel, label=val)
+                    page.select_option(sel, value=val)
                 except Exception:
                     # Fall back: direct value set.
                     page.evaluate(
@@ -217,19 +287,22 @@ def _fetch_results_html(trip: dict) -> str:
                 except Exception:
                     pass
 
-            # Submit. Costco's submit button is inside the form; selector kept loose.
-            page.click(
-                "button[type='submit'], "
-                "input[type='submit'], "
-                "#findMyCarButton, "
-                "button:has-text('Search')"
-            )
+            # Submit. Click the rental search button explicitly — the page has
+            # several other submit buttons (Hotels/Packages tabs), so a generic
+            # "button[type=submit]" can hit the wrong one.
+            try:
+                page.click("#findMyCarButton")
+            except Exception:
+                page.click(
+                    "button[type='submit'], input[type='submit'], button:has-text('Search')"
+                )
 
-            # Wait for results to render. Try several possible result-container hints.
+            # Wait for the results cards to render (the parser keys on
+            # <a class="car-result-card">). Keep the older hints as fallbacks.
             try:
                 page.wait_for_selector(
-                    ".car-class-result, .rate-result, .results, [data-testid*='result'], "
-                    "table.results, .vehicle-card",
+                    "a.car-result-card, .car-result-card, .car-class-result, .rate-result, "
+                    ".results, [data-testid*='result'], table.results, .vehicle-card",
                     timeout=60000,
                 )
             except PlaywrightTimeout:
@@ -239,8 +312,9 @@ def _fetch_results_html(trip: dict) -> str:
             page.wait_for_load_state("networkidle", timeout=30000)
             html = page.content()
         finally:
-            context.close()
-            browser.close()
+            # Close only the tab; leave the shared real Chrome running so the
+            # next daily run reuses it (warm Akamai cookies, faster startup).
+            page.close()
 
     return html
 

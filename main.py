@@ -13,6 +13,7 @@ repo) commit + push to GitHub Pages.
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import yaml
@@ -100,8 +101,14 @@ def main() -> None:
         pairs.append((result, alert, trip))
 
     if not pairs:
-        print("\nNo successful trips this run.")
-        return
+        msg = "Rental bot: 0 offers across all trips (scrape likely blocked)."
+        print(f"\n{msg}")
+        if shutil.which("notify-send"):
+            subprocess.run(
+                ["notify-send", "🚗 Rental bot failed", msg, "--urgency=critical"],
+                check=False,
+            )
+        sys.exit(1)
 
     write_summary(OUTPUT_TXT, [(r, a) for r, a, _ in pairs])
     write_html(OUTPUT_HTML, pairs, CSV_PATH)

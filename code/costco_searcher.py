@@ -435,7 +435,12 @@ def search_trip(trip: dict, *, cache_ttl_hours: int, top_n: int = 5) -> CarRenta
         html = cached["html"]
     else:
         html = _fetch_results_html(trip)
-        _write_cache(cache_file, {"html": html, "fetched_at": time.time()})
+        # Only cache a page that actually carried offers. Costco's Akamai serves
+        # a card-less block/empty page when it distrusts the browser; caching
+        # that would turn a momentary block into a `cache_ttl_hours`-long outage
+        # of stale "0 offers". A blocked page is re-fetched on the next run.
+        if "car-result-card" in html:
+            _write_cache(cache_file, {"html": html, "fetched_at": time.time()})
     _save_debug("costcoSearchCarRentals", html)
 
     offers = _parse_results(html, currency, pickup_name, dropoff_name)
